@@ -1,0 +1,746 @@
+---
+title: "DATA 624 Project 1"
+author: "Susanna Wong"
+date: "2025-10-18"
+output: 
+  html_document:
+    theme: cerulean
+    code_folding: hide
+    toc: true
+    toc_float: true
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Packages
+
+```{r,  message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(fpp3)
+library(seasonal)
+
+```
+
+# Load Dataset
+
+For re-productivity of the RMD file, a csv file of all data to my Github. 
+
+```{r}
+atm_raw_data <- read.csv("https://raw.githubusercontent.com/suswong/DATA-624/refs/heads/main/ATM624Data.csv")
+
+residential_raw_data <- read.csv("https://raw.githubusercontent.com/suswong/DATA-624/refs/heads/main/ResidentialCustomerForecastLoad-624.csv")
+
+pipe1_raw_data <- read.csv("https://raw.githubusercontent.com/suswong/DATA-624/refs/heads/main/Waterflow_Pipe1.csv")
+
+pipe2_raw_data <- read.csv("https://raw.githubusercontent.com/suswong/DATA-624/refs/heads/main/Waterflow_Pipe2.csv")
+```
+
+# ATM DATA {.tabset}
+
+Goal: Forecast ATM cash withdrawal from each ATM for May 2010.
+
+## Data Exploration & Wrangling {.tabset}
+
+This time series contain 1474 observations of ATM cash withdrawal from May 2009 to May 2010. Observing the raw data, we need to convert `DATE` from character to datetime and factor ATM. 
+ 
+There are 19 observations with missing data in the amount of cash that was withdrawn. The maximum cash withdrawal of 10920 which is equivalent to \$1,092,000 seem to be an outlier compared to the mean (\$15,560) and median (\$7,300) cash withdrawal. 
+
+
+```{r}
+summary(atm_raw_data)
+```
+
+There are 14 missing values in the ATM column and 19 missing values in the cash column.
+
+```{r}
+atm_data <- atm_raw_data %>%
+  mutate(DATE = mdy_hms(DATE)
+  )
+##
+##  mutate(
+##    Year = year(date),
+##    Month = month(date, label = TRUE),
+##    Day = day(date),
+##    Day_of_the_week = wday(date, label = TRUE),
+##    Hour = format(date, "%H")
+
+atm_data <- atm_data %>%
+  mutate(DATE = as_date(DATE),
+    ATM = as.factor(ATM),
+         Cash = as.numeric(Cash)) %>%
+  as_tsibble(index = DATE, key = ATM)
+
+#summary(atm_data)
+```
+
+### Missing Data
+
+There are 19 observations with missing data in the amount of cash that was withdrawn.
+
+14 of these missing values occur in May 2010, the month to forecast.
+Filter out or drop those observation from the training data.
+
+The remaining 5 observations are missing cash values in June 2009, with three from ATM1 and two from ATM 2.
+
+```{r}
+atm_data %>% 
+  filter(is.na(Cash))
+```
+
+Filter out the 14 observations in May 2010.
+
+```{r}
+atm_filter <- atm_data %>%
+  filter(!(is.na(Cash) & month(DATE) == 5 & year(DATE) ==2010))
+
+atm_filter  %>% 
+  filter(is.na(Cash))
+```
+
+Since ATM cash withdrawals are likely seasonal by the day of the week, we can use `na.interp()` to fill the missing cash values as it preserves the trend & seasonality.
+
+Initially, I thought of replacing the missing value with the mean cash of the relevant ATM.
+However, doing so will ignore the trends and seasonality.
+Filling the missing values with a simple "0" may misrepresent the them as 0 withdrawal.
+
+```{r}
+# Source: https://otexts.com/fpp2/missing-outliers.html
+atm_final <- atm_filter %>%
+  group_by_key() %>%
+  mutate(Cash = na.interp(Cash)) %>%
+  ungroup()
+
+```
+
+### Outliers {.tabset}
+
+Plotting all ATMs in one plot, we can see ATM 4 generally contains higher cash withdrawals than the other three ATMs.
+Yet, it is difficult to see the trends of the other ATMs.
+So we should plot them separately.
+
+```{r}
+atm_final %>%
+  autoplot(Cash) +
+  labs(title = "ATM Cash Withdrawals from May 2009 to April 2010", 
+       x = "Date",
+       y = "Cash (hundreds in dollars)")
+```
+
+
+With the ATMs plotted separately, we can see ATM3's values are zeros for almost the entire time until late April 2010.
+Only three days contain nonzero cash values.
+There could be various explanation for this: - This is a new ATM.
+So there are no prior cash withdrawals.
+- The data contains daily integer cash withdrawal in hundreds.
+Perhaps the amount were rounded.
+The cash withdrawals were all less than \$50 so they round to 0 when rounded to the nearest hundreds.
+
+Regardless, forecasting this ATM will not be meaningful as there are no clear pattern from the 3 days that contain nonzero cash values.
+We can either exclude this ATM or forecast a simple naive model.
+
+ATM 4 has a large outlier on February 9th, 2010 with an unusual cash withdrawal of \$1,092,000 dollar.
+I searched online to see if there were any events occuring in early February that may cause such a large withdrawal.
+I found:
+
+-   February 5th-6th: A major snowstorm in eastern United States caused flights cancellation and power outages.
+    Since people may be snowed in, the snowstorm could lead to unusual cash withdrawal days before and after the snowstorm.
+
+-   February 12th: XXI Olympic Winter Games in Vancouver, Canada.
+    Big events like this attract large crowds and higher spending near the area.
+
+Even so, there is no available information from the dataset that connects the February 9th spike to the events above.
+
+```{r}
+atm_final %>%
+  autoplot(Cash) +
+  facet_wrap(~ATM, scales = "free_y") +
+  labs(title = "ATM Cash Withdrawals from May 2009 to April 2010", 
+       x = "Date",
+       y = "Cash (hundreds in dollars)")
+```
+
+There are outliers present in ATM1, and ATM4. ATM3 seem to have 3 outlier point. Recall, ATM3 contains 9 cash value prior late April 2010. Due to the extreme value on the right, ATM4 is right skewed. 
+
+```{r}
+atm_final %>%
+  ggplot(aes(x = Cash, fill = ATM)) + 
+  geom_boxplot() + 
+  facet_wrap(~ATM, scales = "free_x") +
+  labs(title = "Boxplot of ATM Cash Withdrawals from May 2009 to April 2010", 
+       x = "Cash (hundreds in dollars)")
+```
+
+```{r}
+# ah_decomp <- atm_final |>
+#   filter(ATM == "ATM4") |>
+#   # Fit a non-seasonal STL decomposition
+#   model(
+#     stl = STL(Cash ~ season(period = 7), robust = TRUE)
+#   ) |>
+#   components()
+# ah_decomp |> autoplot()
+# 
+# outliers <- ah_decomp |>
+#   filter(
+#     remainder < quantile(remainder, 0.25) - 3*IQR(remainder) |
+#     remainder > quantile(remainder, 0.75) + 3*IQR(remainder)
+#   )
+# outliers
+```
+
+There are a variety of ways to deal with outliers. We can use `tsclean()` or `tsoutliers()` to impute the outliers. Both functions can help maintain the trend and seasonality while imputing the outliers. 
+
+```{r}
+atm_final <- atm_final %>%
+  group_by_key()%>%
+  mutate(
+    Cash = {
+      series <- ts(Cash)
+      out <- tsoutliers(series)
+      if (length(out$index) >0) {
+        series[out$index] <- out$replacements
+      }
+      as.numeric(series)
+    }
+  ) %>%
+  ungroup()
+```
+
+Plotting the cash withdrawals, we see the extreme outliers is no longer there. 
+
+```{r}
+atm_final %>%
+  autoplot(Cash) +
+  facet_wrap(~ATM, scales = "free_y") +
+  labs(title = "ATM Cash Withdrawals from May 2009 to April 2010", 
+       x = "Date",
+       y = "Cash (hundreds in dollars)")
+```
+
+
+### Distribution
+
+The histogram of cash withdrawal can help determine if transformation of the data will be needed. 
+
+ATM1 and ATM2 appears to be bimodal and close to normal. Transformation may not be needed.
+
+ATM3 is heavily skewed right as the majority of the dataset contains zero cash withdrawal except for the 3 recent dates. Even if I did transformation, there's not enough information to produce any meaningful data.
+
+ATM4 appears to be right skewed. We will need to use transformation to reduce skewness. 
+
+```{r}
+atm_raw_data %>%
+  ggplot(aes(x = Cash, fill = ATM)) + 
+  geom_histogram(bins=40) + 
+  facet_wrap(~ATM, scales = "free") +
+  labs(title = "Histogram of ATM Cash Withdrawals from Orginal Dataset", 
+       x = "Cash (hundreds in dollars)")
+```
+
+Imputing the missing value and outlier did help with the visualization of the data. This histogram is more smoothed out, especially for ATM4. 
+
+```{r}
+atm_final %>%
+  ggplot(aes(x = Cash, fill = ATM)) + 
+  geom_histogram(bins=40) + 
+  facet_wrap(~ATM, scales = "free") +
+  labs(title = "Histogram of ATM Cash Withdrawals (after dealing with missing values and outliers)", 
+       x = "Cash (hundreds in dollars)")
+```
+
+
+```{r}
+lambda_df <- atm_final %>% 
+  group_by(ATM) %>% 
+  features(Cash, features = guerrero) %>% 
+  select(ATM, lambda_guerrero)
+
+atm_transformed <- atm_final %>%
+  left_join(lambda_df, by= "ATM") %>%
+  mutate(transformed_cash = box_cox(Cash, lambda_guerrero))
+```
+
+
+### Trends {.tabset}
+
+Cash withdrawals seem to peak on Tuesday and Friday for ATM1 and ATM2. More cash wishdrawal on Friday make sense as people usually withdraw their money during payday and that usually occurs on Friday. 
+
+```{r}
+atm_final %>%
+  gg_season(Cash, period = 7)
+```
+
+
+
+#### ATM1
+
+The ATM time series does not appear to have any upward or downward trend.  We do see a seasonality present, which can further confimed by the ACF plot. 
+
+The ACF plot reveals spikes at lag 7, 14, and 21 suggest a weekly seasonal pattern in ATM withdrawals. We should keep this in mind when we model the time serious. 
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM1") %>%
+  model(STL(Cash ~season(period = 7), robust = TRUE))%>%
+          components() %>%
+          autoplot()
+```
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM1") %>%
+  ACF(Cash) %>%
+  autoplot()
+```
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM1") %>%
+  PACF(Cash) %>%
+  autoplot()
+```
+
+#### ATM2
+
+The ATM time series does not appear to have any upward or downward trend.  We do see a seasonality present, which can further confimed by the ACF plot. 
+
+The ACF plot reveals spikes at lag 7, 14, and 21 suggest a weekly seasonal pattern in ATM withdrawals.
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM2") %>%
+  model(STL(Cash ~season(period = 7), robust = TRUE))%>%
+          components() %>%
+          autoplot()
+```
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM2") %>%
+  ACF(Cash) %>%
+  autoplot()
+```
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM2") %>%
+  PACF(Cash) %>%
+  autoplot()
+```
+
+#### ATM3
+
+The ATM time series does not appear to have any upward or downward trend. Seasonality is not present as we do not have enough data. Recall we only have 3 recent observations that contain nonzero cash withdrawals 
+
+The ACF and PACF plot reveals nonstationalary. 
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM3") %>%
+  model(STL(Cash ~season(period = 7), robust = TRUE))%>%
+          components() %>%
+          autoplot()
+```
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM3") %>%
+  ACF(Cash) %>%
+  autoplot()
+```
+
+```{r}
+atm_final %>%
+  filter(ATM == "ATM3") %>%
+  PACF(Cash) %>%
+  autoplot()
+```
+
+#### ATM4
+
+The ATM time series does not appear to have any upward or downward trend.  We do see a seasonality present, which can further confirmed by the ACF plot. 
+
+Compared to the previous ACF plot, most the autocorrections are within the confidence interval. This ACF plot behave closer to white noise. 
+
+```{r}
+atm_transformed %>%
+  filter(ATM == "ATM4") %>%
+  model(STL(transformed_cash ~season(period = 7), robust = TRUE))%>%
+          components() %>%
+          autoplot()
+```
+
+```{r}
+atm_transformed %>%
+  filter(ATM == "ATM4") %>%
+  ACF(transformed_cash) %>%
+  autoplot()
+```
+
+```{r}
+atm_transformed %>%
+  filter(ATM == "ATM4") %>%
+  PACF(transformed_cash) %>%
+  autoplot()
+```
+
+## Modeling {.tabset}
+
+Below is a test to see if a time series is stationary or non-stationary. Based on the test results, ATM1 and ATM2 are stationary and ATM3 and ATM4 are non-stationary. 
+
+```{r}
+atm_final %>%
+  features(Cash, unitroot_kpss)
+```
+
+One seasonal difference is required to make ATM1 and ATM2 stationary. No further regular difference is needed.
+
+```{r}
+atm_final %>%
+  features(Cash, unitroot_nsdiffs)
+```
+
+```{r}
+atm_final %>%
+  features(difference(Cash, 7), unitroot_ndiffs)
+```
+
+### ATM 1 & 2
+
+```{r}
+fit <- atm_final %>%
+  filter(ATM != "ATM3" & ATM !="ATM4")%>%
+  model(ARIMA(Cash))
+
+fit
+report(fit)
+
+atm3_fit <- atm_final %>%
+  filter(ATM == "ATM3") %>%
+  model(NAIVE(Cash))
+
+atm4_fit <- atm_transformed %>%
+  filter(ATM == "ATM4")%>%
+  model(ARIMA(transformed_cash))
+
+
+
+
+atm3_fit
+
+
+report(atm3_fit)
+
+atm4_fit
+report(atm4_fit)
+```
+
+#### Residuals
+
+```{r}
+fit %>%
+  filter(ATM == "ATM1")%>%
+  gg_tsresiduals()
+```
+
+```{r}
+fit %>%
+  filter(ATM == "ATM2")%>%
+  gg_tsresiduals()
+```
+
+```{r}
+atm3_fit %>%
+  filter(ATM == "ATM3")%>%
+  gg_tsresiduals()
+```
+
+
+```{r}
+atm4_fit %>%
+  filter(ATM == "ATM4")%>%
+  gg_tsresiduals()
+```
+
+
+```{r}
+fit %>%
+  forecast(h=31)%>%
+  autoplot(atm_final)
+```
+
+```{r}
+atm3_fit %>%
+  forecast(h=31)%>%
+  autoplot(atm_final)
+```
+
+```{r}
+atm4_fit %>%
+  forecast(h=31)%>%
+  autoplot(atm_transformed)
+```
+
+
+# Residential Power Consumption {.tabset}
+
+Any utility data is likely to be seasonal. People tend to use more electricity on weekend as they are at home and not at work or even during warmer months (AC usage) or colder months (heating usage). 
+
+## Data Exploration & Wrangling {.tabset}
+
+```{r}
+summary(residential_raw_data)
+```
+
+```{r}
+residential_data <- residential_raw_data %>%
+  rename(date = "YYYY.MMM" ) %>%
+  mutate(date = yearmonth(date)) %>%
+  select(-CaseSequence) %>%
+  as_tsibble(index = date)
+```
+
+### Missing Data
+
+There is one missing value for KWH on September 2008. We will impute it using 
+
+```{r}
+residential_data %>% 
+  filter(is.na(KWH))
+```
+
+Since residential power consumption is likely seasonal by the day of the week or month, we can use `na.interp()` to fill the missing cash values as it preserves the trend & seasonality.
+Simply replacing the missing value with the mean or median will ignore the trends and seasonality.
+Filling the missing values with a simple "0" may misrepresent the them as 0 power usage.
+
+```{r}
+clean_data <- residential_data %>%
+  mutate(KWH=na.interp(ts(KWH, frequency = 12)))
+
+clean_data %>% 
+  filter(is.na(KWH))
+```
+
+### Outlier
+
+There appears to be an extreme low outlier in July 2010 of 770523 KWH. I searched online to see if there were any events occurring in July 2010 that may be related to the low consumption
+I found:
+
+-   July 15: Michigan, US lose power due to major storm
+-   July 25: Virginia, US lose power due to major storm
+(Souce:https://en.wikipedia.org/wiki/List_of_major_power_outages)
+
+Even so, there is no available information from the dataset that connects the July 2010 dip to the events above.
+
+```{r}
+clean_data %>%
+  autoplot(KWH) +
+  labs(title = "Residential Power Consumption", 
+       x = "Date",
+       y = "KWH") + 
+  geom_smooth(method = "loess")
+```
+
+```{r}
+clean_data %>%
+  ggplot(aes(x = KWH)) + 
+  geom_boxplot(fill='lightblue') + 
+  labs(title = "Boxplot of Residential Power Consumption", 
+       x = "KWH")
+```
+
+There are a variety of ways to deal with outliers. We can use `tsclean()` or `tsoutliers()` to impute the outliers. Both functions can help maintain the trend and seasonality while imputing the outliers. 
+
+```{r}
+clean_data <- clean_data %>%
+  mutate(
+    KWH = {
+      series <- ts(KWH, frequency = 12)
+      out <- tsoutliers(series)
+      if (length(out$index) >0) {
+        series[out$index] <- out$replacements
+      }
+      as.numeric(series)
+    }
+  ) %>%
+  ungroup()
+```
+
+Plotting the cash withdrawals, we see the extreme outliers is no longer there.We see an increasing overall trend of power consumption.
+
+```{r}
+clean_data %>%
+  autoplot(KWH) +
+  labs(title = "Residential Power Consumption", 
+       x = "Date",
+       y = "KWH") + 
+  geom_smooth(method = "loess")
+```
+
+### Distribtion
+
+It appears right skewed. We should use box cox transformation to address the skewness and stable variance. 
+
+```{r}
+clean_data %>%
+  ggplot(aes(x = KWH)) + 
+  geom_histogram( fill = 'lightblue') +
+  labs(title = "Histogram of Residential Power Consumption", 
+       subtitle = "Missing Values and Outlier Imputed",
+       x = "KWH")
+```
+
+lambda = -0.1455
+
+
+```{r}
+lambda <- clean_data %>% 
+  features(KWH, features = guerrero) %>% 
+  pull(lambda_guerrero)
+
+clean_data <- clean_data %>%
+  mutate(transformed_KWH = box_cox(KWH, lambda))
+```
+
+
+```{r}
+clean_data %>%
+  ggplot(aes(x = transformed_KWH)) + 
+  geom_histogram( fill = 'lightblue') +
+  labs(title = "Histogram of Residential Power Consumption", 
+       subtitle = "Missing Values and Outlier Imputed",
+       x = "KWH")
+```
+
+### Trends
+
+Seasonality is present. There are higher power consumption during the colder months (December and January) and warmer months (July and August). 
+
+```{r}
+clean_data %>%
+  gg_season(transformed_KWH, period = 12)
+```
+
+The STL decomposition further confirms there is an increasing overall trend of power consumption over the years. The trend was relatively stable between 2000 and 2005, and gradual upward trend after 2005. There are notable spikes in the remainder panel that represent events or noises still not explained by the overall or seasonal trends. 
+
+
+```{r}
+clean_data %>%
+  model(STL(transformed_KWH ~season(period = 12), robust = TRUE))%>%
+          components() %>%
+          autoplot()
+```
+
+ACF plot shows strong positive correlations at lag 1, 6, 12, and 18. It also shows strong negative correlations at lag 3, 9, and 12. This furthur confirms strong seasonality is present. We can try MA (1), MA(3), and more for arima modeling. 
+
+```{r}
+clean_data %>%
+  ACF(transformed_KWH) %>%
+  autoplot()
+```
+
+There are significant spikes in lags 1, 2, 5, 11, and 12. We can try AR(1), AR(2), AR(5), and more for arima modeling.
+
+```{r}
+clean_data %>%
+  PACF(transformed_KWH) %>%
+  autoplot()
+```
+
+Below is a test to see if a time series is stationary or non-stationary. Based on the test results, this time series is non-stationary. 
+
+```{r}
+clean_data %>%
+  features(transformed_KWH, unitroot_kpss)
+```
+
+One seasonal difference is required to make ATM1 and ATM2 stationary. No further regular difference is needed.
+
+```{r}
+clean_data %>%
+  features(transformed_KWH, unitroot_nsdiffs)
+```
+
+```{r}
+clean_data %>%
+  features(difference(transformed_KWH, 12), unitroot_ndiffs)
+```
+
+We can try different arima model variation to find the best model. All models must have D=1 as the time series is non-stationary and requires a seasonal difference and period = 12. d=0 since we do not expect another first order difference. This model ARIMA(1,0,0)(1,1,0)[12] w/ drift> has the lowest AIC. 
+
+```{r}
+fit <- clean_data %>%
+  model(ets = ETS(transformed_KWH ~error("A")+trend("A")+season ("A")),
+    model = ARIMA(transformed_KWH),
+    arima100110 = ARIMA(transformed_KWH ~ pdq(1,0,0)+PDQ (1,1,0)),
+    arima001011 = ARIMA(transformed_KWH ~ pdq(0,0,1)+PDQ (0,1,1)),
+    arima100011 = ARIMA(transformed_KWH ~ pdq(1,0,0)+PDQ (0,1,1)),
+    arima001110 = ARIMA(transformed_KWH ~ pdq(0,0,1)+PDQ (1,1,0)),
+    arima003110 = ARIMA(transformed_KWH ~ pdq(0,0,3)+PDQ (1,1,0)),
+
+    )
+
+fit
+
+report(fit)
+```
+
+
+```{r}
+fit%>%
+  select(model) %>%
+  gg_tsresiduals()
+```
+
+```{r}
+fit%>%
+  select(ets) %>%
+  gg_tsresiduals()
+```
+
+
+```{r}
+fit %>%
+  forecast(h="5 years")%>%
+  autoplot(clean_data, levels= NULL)
+```
+
+```{r}
+fc <- fit %>%
+  forecast(h="5 years")
+fc %>%
+  write_csv("~/Downloads/residential_fc_data.csv")
+```
+
+# Extra Credit 
+
+As we do not information on the pipe location, type of pipe, and more. Forecasting the water pipe separately can preserve its trends. 
+
+## Water Pipe 1
+
+```{r}
+summary(pipe1_raw_data)
+```
+
+```{r}
+pipe1 <- pipe1_raw_data %>%
+  rename(date = "Date.Time" ) %>%
+  mutate(date = mdy_hm(date)) %>%
+
+```
+
+
+
+```{r}
+
+
+
+```
